@@ -19,6 +19,7 @@
 #       ARMED: Set to "true" to take action on keys; "false" limits to reporting
 #       LOG_LEVEL: (optional): sets the level for function logging
 #                  valid input: critical, error, warning, info (default), debug
+#       EMAIL_ENABLED: used to enable or disable the SES emailed report
 #       EMAIL_SOURCE: send from address for the email, authorized in SES
 #       EMAIL_SUBJECT: subject line for the email
 #       EMAIL_TARGET: default email address if event fails to pass a valid one
@@ -27,7 +28,10 @@
 #       KEY_AGE_INACTIVE: age at which a key should be inactive (e.g. 90)
 #       KEY_AGE_WARNING: age at which to warn (e.g. 75)
 #       KEY_USE_THRESHOLD: age at which unused keys should be deleted (e.g.30)
-#
+#       S3_ENABLED: set to "true" and provide S3_BUCKET if the audit report
+#                   should be written to S3
+#       S3_BUCKET: bucket name to write the audit report to if S3_ENABLED is
+#                   set to "true"
 ###############################################################################
 
 from botocore.exceptions import ClientError
@@ -262,33 +266,49 @@ def process_message(htmlBody):
     html = htmlHeader + htmlBody + htmlFooter
     log.info('%s', html)
 
-    # Establish SES Client
-    client_ses = boto3.client('ses')
-
-    # Construct and Send Email
-    try:
-        response = client_ses.send_email(
-            Destination={
-                'ToAddresses': [os.environ['EMAIL_TARGET']]
-            },
-            Message={
-                'Body': {
-                    'Html': {
-                        'Charset': "UTF-8",
-                        'Data': html,
-                    }
-                },
-                'Subject': {
-                    'Charset': "UTF-8",
-                    'Data': os.environ['EMAIL_SUBJECT'],
-                },
-            },
-            Source=os.environ['EMAIL_SOURCE']
-            )
-    except ClientError as e:
-        log.info('Error: %s', e.response['Error']['Message'])
+    # Optionally write the report to S3
+    if os.environ['S3_ENABLED'] == 'true':
+        client_s3 = boto3.client('s3')
+        s3_key = 'access_key_audit_report_' + str(datetime.date.today()) + '.html'
+        response = client_s3.put_object(
+            Bucket=os.environ['S3_BUCKET'],
+            Key=s3_key,
+            Body=html
+        )
     else:
-        log.info('Success. Message ID: %s', response['MessageId']),
+        log.info("S3 report not enabled per environment variable setting")
+
+    # Optionally send report via SES Email
+    if os.environ['EMAIL_ENABLED'] == 'true':
+        # Establish SES Client
+        client_ses = boto3.client('ses')
+
+        # Construct and Send Email
+        try:
+            response = client_ses.send_email(
+                Destination={
+                    'ToAddresses': [os.environ['EMAIL_TARGET']]
+                },
+                Message={
+                    'Body': {
+                        'Html': {
+                            'Charset': "UTF-8",
+                            'Data': html,
+                        }
+                    },
+                    'Subject': {
+                        'Charset': "UTF-8",
+                        'Data': os.environ['EMAIL_SUBJECT'],
+                    },
+                },
+                Source=os.environ['EMAIL_SOURCE']
+                )
+        except ClientError as e:
+            log.info('Error: %s', e.response['Error']['Message'])
+        else:
+            log.info('Success. Message ID: %s', response['MessageId'])
+    else:
+        log.info("Email not enabled per environment variable setting")
 
 
 ###############################################################################
