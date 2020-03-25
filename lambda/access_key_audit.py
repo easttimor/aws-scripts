@@ -105,65 +105,106 @@ def lambda_handler(event, context):
 def process_users(client_iam, report):
     # Initialize message content
     htmlBody = ''
+    line = ''
 
     # Access the credential report and process it
     for row in report:
         # A row is a unique IAM user
         UserName = row['user']
         log.debug("Processing user: %s", UserName)
-        exemption = 'false'
+        exemption = False
         if UserName != '<root_account>':
 
             # Test group exemption
             groups = client_iam.list_groups_for_user(UserName=UserName)
             for g in groups['Groups']:
                 if g['GroupName'] == os.environ['EXEMPT_GROUP']:
-                    exemption = 'true'
+                    exemption = True
                     log.info('User is exempt via group membership in: %s', g['GroupName'])
 
             # Process Access Keys for user
             access_keys = client_iam.list_access_keys(UserName=UserName)
             for key in access_keys['AccessKeyMetadata']:
                 key_age = object_age(key['CreateDate'])
+                AccessKeyId = key['AccessKeyId']
 
-                if key_age >= int(os.environ['KEY_AGE_WARNING']):
-                    # reset
-                    report = 'true'
-                    AccessKeyId = key['AccessKeyId']
+                # get time of last key use
+                GetKey = client_iam.get_access_key_last_used(
+                    AccessKeyId=AccessKeyId
+                )
 
-                    # gather full info about the key
-                    GetKey = client_iam.get_access_key_last_used(
-                        AccessKeyId=AccessKeyId
+                # LastUsedDate value will not exist if key not used
+                if 'LastUsedDate' in GetKey['AccessKeyLastUsed']:
+                    LastUsedDate = GetKey['AccessKeyLastUsed']['LastUsedDate']
+                elif key_age >= int(os.environ['KEY_USE_THRESHOLD']) and not exemption:
+                    # Key has not been used and has exceeded age threshold
+                    # NOT EXEMPT: Delete unused
+                    delete_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#E6B0AA"><td>' +
+                        UserName+'</td><td>' +
+                        key['AccessKeyId']+'</td><td>' +
+                        str(key_age)+'</td><td>' +
+                        'DELETED'+'</td><td>' +
+                        str(LastUsedDate)+'</td></tr>'
                     )
+                    htmlBody = htmlBody + line
 
-                    # LastUsedDate value will not exist if key not used
-                    if 'LastUsedDate' in GetKey['AccessKeyLastUsed']:
-                        LastUsedDate = GetKey['AccessKeyLastUsed']['LastUsedDate']
-                    else:
-                        LastUsedDate = 'Unused'
-
-                    if LastUsedDate == 'Unused' and key_age >= int(os.environ['KEY_USE_THRESHOLD']) and exemption == 'false':
-                        # Delete unused keys
+                # Process keys older than warning threshold
+                if key_age >= int(os.environ['KEY_AGE_WARNING']):
+                    if key_age >= int(os.environ['KEY_AGE_DELETE']) and not exemption:
+                        # NOT EXEMPT: Delete
                         delete_access_key(AccessKeyId, UserName, client_iam)
-                        line = '<tr bgcolor= "#E6B0AA"><td>'+UserName+'</td><td>'+key['AccessKeyId']+'</td><td>'+str(key_age)+'</td><td>'+'DELETED'+'</td><td>'+str(LastUsedDate)+'</td></tr>'
-                    elif key_age >= int(os.environ['KEY_AGE_DELETE']) and exemption == 'false':
-                        # Delete key exceeding age of KEY_AGE_DELETE
-                        delete_access_key(AccessKeyId, UserName, client_iam)
-                        line = '<tr bgcolor= "#E6B0AA"><td>'+UserName+'</td><td>'+key['AccessKeyId']+'</td><td>'+str(key_age)+'</td><td>'+'DELETED'+'</td><td>'+str(LastUsedDate)+'</td></tr>'
-                    elif key_age >= int(os.environ['KEY_AGE_INACTIVE']) and exemption == 'false':
-                        # Disable key exceeding age of KEY_AGE_INACTIVE
+                        line = (
+                            '<tr bgcolor= "#E6B0AA"><td>' +
+                            UserName+'</td><td>' +
+                            key['AccessKeyId']+'</td><td>' +
+                            str(key_age)+'</td><td>' +
+                            'DELETED'+'</td><td>' +
+                            str(LastUsedDate)+'</td></tr>'
+                        )
+                    elif key_age >= int(os.environ['KEY_AGE_INACTIVE']) and not exemption:
+                        # NOT EXEMPT: Disable
                         disable_access_key(AccessKeyId, UserName, client_iam)
-                        line = '<tr bgcolor= "#F4D03F"><td>'+UserName+'</td><td>'+key['AccessKeyId']+'</td><td>'+str(key_age)+'</td><td>'+key['Status']+'</td><td>'+str(LastUsedDate)+'</td></tr>'
-                    elif exemption == 'false':
-                        # Report non-exempt key, no action (not past thresholds)
-                        line = '<tr><td>'+UserName+'</td><td>'+key['AccessKeyId']+'</td><td>'+str(key_age)+'</td><td>'+key['Status']+'</td><td>'+str(LastUsedDate)+'</td></tr>'
-                    elif key_age >= int(os.environ['KEY_AGE_DELETE']) and exemption == 'true' and key['Status'] == 'Inactive':
-                        # Delete exempt key only if already Inactive
+                        line = (
+                            '<tr bgcolor= "#F4D03F"><td>' +
+                            UserName+'</td><td>' +
+                            key['AccessKeyId']+'</td><td>' +
+                            str(key_age)+'</td><td>' +
+                            key['Status']+'</td><td>' +
+                            str(LastUsedDate)+'</td></tr>'
+                        )
+                    elif not exemption:
+                        # NOT EXEMPT: Report
+                        line = (
+                            '<tr><td>' +
+                            UserName+'</td><td>' +
+                            key['AccessKeyId']+'</td><td>' +
+                            str(key_age)+'</td><td>' +
+                            key['Status']+'</td><td>' +
+                            str(LastUsedDate)+'</td></tr>'
+                        )
+                    elif key_age >= int(os.environ['KEY_AGE_DELETE']) and exemption and key['Status'] == 'Inactive':
+                        # EXEMPT: Delete if Inactive
                         delete_access_key(AccessKeyId, UserName, client_iam)
-                        line = '<tr bgcolor= "#E6B0AA"><td>'+UserName+'</td><td>'+key['AccessKeyId']+'</td><td>'+str(key_age)+'</td><td>'+'DELETED'+'</td><td>'+str(LastUsedDate)+'</td></tr>'
-                    elif exemption == 'true':
-                        # Report exempt key, no action
-                        line = '<tr bgcolor= "#D7DBDD"><td>'+UserName+'</td><td>'+key['AccessKeyId']+'</td><td>'+str(key_age)+'</td><td>'+key['Status']+'</td><td>'+str(LastUsedDate)+'</td></tr>'
+                        line = (
+                            '<tr bgcolor= "#E6B0AA"><td>' +
+                            UserName+'</td><td>' +
+                            key['AccessKeyId']+'</td><td>' +
+                            str(key_age)+'</td><td>' +
+                            'DELETED'+'</td><td>' +
+                            str(LastUsedDate)+'</td></tr>'
+                        )
+                    elif exemption:
+                        # EXEMPT: Report
+                        line = (
+                            '<tr bgcolor= "#D7DBDD"><td>' +
+                            UserName+'</td><td>' +
+                            key['AccessKeyId'] + '</td><td>' +
+                            str(key_age)+'</td><td>' +
+                            key['Status']+'</td><td>' +
+                            str(LastUsedDate)+'</td></tr>'
+                        )
                     else:
                         # This case should not happen
                         log.info('Not including in report, no conditions met for %s.', AccessKeyId)
@@ -186,6 +227,7 @@ def generate_credential_report(client_iam):
         sleep(10)
     except ClientError as e:
         log.info('Error generating credential report: %s', e)
+        raise
 
 
 ###############################################################################
@@ -197,13 +239,10 @@ def get_credential_report(client_iam, report_counter):
     generate_report = client_iam.generate_credential_report()
     if generate_report['State'] == 'COMPLETE':
         log.info('Report state: COMPLETE')
-        try:
-            credential_report = client_iam.get_credential_report()
-            credential_report_csv = io.StringIO(credential_report['Content'].decode('utf-8'))
-            reader = csv.DictReader(credential_report_csv)
-            return list(reader)
-        except ClientError as e:
-            log.info('Error getting Report: %s', e)
+        credential_report = client_iam.get_credential_report()
+        credential_report_csv = io.StringIO(credential_report['Content'].decode('utf-8'))
+        reader = csv.DictReader(credential_report_csv)
+        return list(reader)
     else:
         sleep(5)
         report_counter += 1
@@ -261,7 +300,9 @@ def process_message(htmlBody):
         + ' days).<br>' \
         + ' Grayed out rows are exempt via membership in IAM Group: ' \
         + os.environ['EXEMPT_GROUP'] + '</p>' \
-        + '<table><tr><td><b>IAM User Name</b></td><td><b>Access Key ID</b></td><td><b>Key Age</b></td><td><b>Key Status</b></td><td><b>Last Used</b></td></tr>'
+        + '<table><tr><td><b>IAM User Name</b></td>' \
+        + '<td><b>Access Key ID</b></td>' \
+        + '<td><b>Key Age</b></td><td><b>Key Status</b></td><td><b>Last Used</b></td></tr>'
     htmlFooter = '</table></html>'
     html = htmlHeader + htmlBody + htmlFooter
     log.info('%s', html)
@@ -284,29 +325,25 @@ def process_message(htmlBody):
         client_ses = boto3.client('ses')
 
         # Construct and Send Email
-        try:
-            response = client_ses.send_email(
-                Destination={
-                    'ToAddresses': [os.environ['EMAIL_TARGET']]
-                },
-                Message={
-                    'Body': {
-                        'Html': {
-                            'Charset': "UTF-8",
-                            'Data': html,
-                        }
-                    },
-                    'Subject': {
+        response = client_ses.send_email(
+            Destination={
+                'ToAddresses': [os.environ['EMAIL_TARGET']]
+            },
+            Message={
+                'Body': {
+                    'Html': {
                         'Charset': "UTF-8",
-                        'Data': os.environ['EMAIL_SUBJECT'],
-                    },
+                        'Data': html,
+                    }
                 },
-                Source=os.environ['EMAIL_SOURCE']
-                )
-        except ClientError as e:
-            log.info('Error: %s', e.response['Error']['Message'])
-        else:
-            log.info('Success. Message ID: %s', response['MessageId'])
+                'Subject': {
+                    'Charset': "UTF-8",
+                    'Data': os.environ['EMAIL_SUBJECT'],
+                },
+            },
+            Source=os.environ['EMAIL_SOURCE']
+        )
+        log.info('Success. Message ID: %s', response['MessageId'])
     else:
         log.info("Email not enabled per environment variable setting")
 
