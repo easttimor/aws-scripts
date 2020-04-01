@@ -11,6 +11,7 @@
 #       ec2:DeleteSecurityGroup
 #       ec2:DescribeSecurityGroups
 #       ec2:DescribeNetworkInterfaces
+#       ec2:RevokeSecurityGroup*
 #       s3:PutObject
 #       ses:SendEmail
 # Environment Variables:
@@ -156,7 +157,7 @@ def process_security_groups(ec2_client):
                     .format(sg['GroupId'], sg['VpcId'], sg['GroupName'])
                 )
             else:
-            # EXEMPT: Report only
+                # EXEMPT: Report only
                 line = (
                     '<tr bgcolor= "#C0C0C0">'
                     '<td>{}</td>'
@@ -213,7 +214,7 @@ def delete_security_groups(ec2_client, deletion_list):
                 GroupId=sg
             )
         except:
-            log.info('Dependency issue with %s',sg)
+            log.info('Dependency issue with %s', sg)
             dependency_list.append(sg)
     return dependency_list
 
