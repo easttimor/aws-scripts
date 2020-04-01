@@ -16,7 +16,8 @@
 # Environment Variables:
 #       ACCOUNT_NAME: AWS Account (friendly) Name
 #       ACCOUNT_NUMBER: AWS Account Number
-#       ARMED: Set to "true" to take action on keys; "false" limits to reporting
+#       ARMED: Set to "true" to take action on keys;
+#               "false" limits to reporting
 #       LOG_LEVEL: (optional): sets the level for function logging
 #                  valid input: critical, error, warning, info (default), debug
 #       EMAIL_ENABLED: used to enable or disable the SES emailed report
@@ -85,18 +86,50 @@ def lambda_handler(event, context):
     client_iam = boto3.client('iam')
 
     # Generate Credential Report
-    generate_credential_report(client_iam)
+    report_counter = 0
+    generate_credential_report(client_iam, report_counter)
 
     # Get Credential Report
-    report_counter = 0
-    report = get_credential_report(client_iam, report_counter)
+    report = get_credential_report(client_iam)
 
     # Process Users in Credential Report
-    if report is not None:
-        body = process_users(client_iam, report)
+    body = process_users(client_iam, report)
 
     # Process message for SES
     process_message(body)
+
+
+###############################################################################
+# Generate IAM Credential Report
+###############################################################################
+def generate_credential_report(client_iam, report_counter):
+
+    generate_report = client_iam.generate_credential_report()
+    sleep(10)
+
+    if generate_report['State'] == 'COMPLETE':
+        # Report is generated, proceed in Handler
+        return None
+    else:
+        # Report is note ready, try again
+        report_counter += 1
+        if report_counter < 5:
+            log.info('Still waiting on report generation')
+            return generate_credential_report(client_iam, report_counter)
+        else:
+            log.info('Credential report generation throttled - exit', exc_info=1)
+            return exit
+
+
+###############################################################################
+# Process IAM Credential Report
+###############################################################################
+def get_credential_report(client_iam):
+
+    credential_report = client_iam.get_credential_report()
+    credential_report_csv = io.StringIO(credential_report['Content'].decode('utf-8'))
+    reader = csv.DictReader(credential_report_csv)
+    return list(reader)
 
 
 ###############################################################################
@@ -134,124 +167,119 @@ def process_users(client_iam, report):
                 )
 
                 # LastUsedDate value will not exist if key not used
-                if 'LastUsedDate' in GetKey['AccessKeyLastUsed']:
-                    LastUsedDate = GetKey['AccessKeyLastUsed']['LastUsedDate']
-                elif key_age >= int(os.environ['KEY_USE_THRESHOLD']) and not exemption:
+                LastUsedDate = GetKey['AccessKeyLastUsed'].get('LastUsedDate')
+                if (
+                    not LastUsedDate and
+                    key_age >= int(os.environ['KEY_USE_THRESHOLD']) and
+                    not exemption
+                ):
                     # Key has not been used and has exceeded age threshold
                     # NOT EXEMPT: Delete unused
                     delete_access_key(AccessKeyId, UserName, client_iam)
                     line = (
-                        '<tr bgcolor= "#E6B0AA"><td>' +
-                        UserName+'</td><td>' +
-                        key['AccessKeyId']+'</td><td>' +
-                        str(key_age)+'</td><td>' +
-                        'DELETED'+'</td><td>' +
-                        str(LastUsedDate)+'</td></tr>'
+                        '<tr bgcolor= "#E6B0AA">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>DELETED</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), str(LastUsedDate))
                     )
                     htmlBody = htmlBody + line
 
                 # Process keys older than warning threshold
-                if key_age >= int(os.environ['KEY_AGE_WARNING']):
-                    if key_age >= int(os.environ['KEY_AGE_DELETE']) and not exemption:
-                        # NOT EXEMPT: Delete
-                        delete_access_key(AccessKeyId, UserName, client_iam)
-                        line = (
-                            '<tr bgcolor= "#E6B0AA"><td>' +
-                            UserName+'</td><td>' +
-                            key['AccessKeyId']+'</td><td>' +
-                            str(key_age)+'</td><td>' +
-                            'DELETED'+'</td><td>' +
-                            str(LastUsedDate)+'</td></tr>'
-                        )
-                    elif key_age >= int(os.environ['KEY_AGE_INACTIVE']) and not exemption:
-                        # NOT EXEMPT: Disable
-                        disable_access_key(AccessKeyId, UserName, client_iam)
-                        line = (
-                            '<tr bgcolor= "#F4D03F"><td>' +
-                            UserName+'</td><td>' +
-                            key['AccessKeyId']+'</td><td>' +
-                            str(key_age)+'</td><td>' +
-                            key['Status']+'</td><td>' +
-                            str(LastUsedDate)+'</td></tr>'
-                        )
-                    elif not exemption:
-                        # NOT EXEMPT: Report
-                        line = (
-                            '<tr><td>' +
-                            UserName+'</td><td>' +
-                            key['AccessKeyId']+'</td><td>' +
-                            str(key_age)+'</td><td>' +
-                            key['Status']+'</td><td>' +
-                            str(LastUsedDate)+'</td></tr>'
-                        )
-                    elif key_age >= int(os.environ['KEY_AGE_DELETE']) and exemption and key['Status'] == 'Inactive':
-                        # EXEMPT: Delete if Inactive
-                        delete_access_key(AccessKeyId, UserName, client_iam)
-                        line = (
-                            '<tr bgcolor= "#E6B0AA"><td>' +
-                            UserName+'</td><td>' +
-                            key['AccessKeyId']+'</td><td>' +
-                            str(key_age)+'</td><td>' +
-                            'DELETED'+'</td><td>' +
-                            str(LastUsedDate)+'</td></tr>'
-                        )
-                    elif exemption:
-                        # EXEMPT: Report
-                        line = (
-                            '<tr bgcolor= "#D7DBDD"><td>' +
-                            UserName+'</td><td>' +
-                            key['AccessKeyId'] + '</td><td>' +
-                            str(key_age)+'</td><td>' +
-                            key['Status']+'</td><td>' +
-                            str(LastUsedDate)+'</td></tr>'
-                        )
-                    else:
-                        # This case should not happen
-                        log.info('Not including in report, no conditions met for %s.', AccessKeyId)
-                    htmlBody = htmlBody + line
+                if key_age < int(os.environ['KEY_AGE_WARNING']):
+                    continue
 
-                    # Log it
-                    log.info('%s \t %s \t %s \t %s', UserName, key['AccessKeyId'], str(key_age), key['Status'])
+                if (
+                    key_age >= int(os.environ['KEY_AGE_DELETE']) and
+                    not exemption
+                ):
+                    # NOT EXEMPT: Delete
+                    delete_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#E6B0AA">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>DELETED</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), str(LastUsedDate))
+                    )
+                elif (
+                    key_age >= int(os.environ['KEY_AGE_INACTIVE']) and
+                    not exemption
+                ):
+                    # NOT EXEMPT: Disable
+                    disable_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#F4D03F">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), key['Status'], str(LastUsedDate))
+                    )
+                elif not exemption:
+                    # NOT EXEMPT: Report
+                    line = (
+                        '<tr bgcolor= "#FFFFFF">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), key['Status'], str(LastUsedDate))
+                    )
+                elif (
+                    key_age >= int(os.environ['KEY_AGE_DELETE']) and
+                    exemption and
+                    key['Status'] == 'Inactive'
+                ):
+                    # EXEMPT: Delete if Inactive
+                    delete_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#E6B0AA">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>DELETED</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), str(LastUsedDate))
+                    )
+                elif exemption:
+                    # EXEMPT: Report
+                    line = (
+                        '<tr bgcolor= "#D7DBDD">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), key['Status'], str(LastUsedDate))
+                    )
+                else:
+                    raise Exception('Unhandled case for Access Key %s', key['AccessKeyId'])
+                htmlBody = htmlBody + line
+
+                # Log it
+                log.info('%s \t %s \t %s \t %s', UserName, key['AccessKeyId'], str(key_age), key['Status'])
     if str(htmlBody) == "":
         htmlBody = 'All Access Keys for this account are compliant.'
     return(htmlBody)
-
-
-###############################################################################
-# Generate IAM Credential Report
-###############################################################################
-def generate_credential_report(client_iam):
-    try:
-        log.info('Generating Credential Report')
-        credential_report = client_iam.generate_credential_report()
-        sleep(10)
-    except ClientError as e:
-        log.info('Error generating credential report: %s', e)
-        raise
-
-
-###############################################################################
-# Process IAM Credential Report
-###############################################################################
-def get_credential_report(client_iam, report_counter):
-
-    # check/re-check the state of the report
-    generate_report = client_iam.generate_credential_report()
-    if generate_report['State'] == 'COMPLETE':
-        log.info('Report state: COMPLETE')
-        credential_report = client_iam.get_credential_report()
-        credential_report_csv = io.StringIO(credential_report['Content'].decode('utf-8'))
-        reader = csv.DictReader(credential_report_csv)
-        return list(reader)
-    else:
-        sleep(5)
-        report_counter += 1
-        if report_counter < 5:
-            log.info('Still waiting on report generation')
-            return get_credential_report(client_iam, report_counter)
-        else:
-            log.info('Credential report generation throttled - exit', exc_info=1)
-            return exit
 
 
 ###############################################################################
@@ -289,20 +317,22 @@ def disable_access_key(AccessKeyId, UserName, client):
 # Generate HTML and send to SES
 ###############################################################################
 def process_message(htmlBody):
-    htmlHeader = '<html><h1>Expiring Access Key Report for ' \
-        + os.environ['ACCOUNT_NUMBER'] + ' - ' + os.environ['ACCOUNT_NAME'] + '</h1>' \
-        + '<p>The following access keys are over ' \
-        + os.environ['KEY_AGE_WARNING'] \
-        + ' days old and will soon be marked inactive (' \
-        + os.environ['KEY_AGE_INACTIVE'] \
-        + ' days) and deleted (' \
-        + os.environ['KEY_AGE_DELETE'] \
-        + ' days).<br>' \
-        + ' Grayed out rows are exempt via membership in IAM Group: ' \
-        + os.environ['EXEMPT_GROUP'] + '</p>' \
-        + '<table><tr><td><b>IAM User Name</b></td>' \
-        + '<td><b>Access Key ID</b></td>' \
-        + '<td><b>Key Age</b></td><td><b>Key Status</b></td><td><b>Last Used</b></td></tr>'
+    htmlHeader = (
+        '<html><h1>Expiring Access Key Report for {} - {} </h1>'
+        '<p>The following access keys are over {} days old '
+        'and will soon be marked inactive ({} days) and deleted ({} days).</p>'
+        '<p>Grayed out rows are exempt via membership in IAM Group: {}</p>'
+        '<table>'
+        '<tr><td><b>IAM User Name</b></td>'
+        '<td><b>Access Key ID</b></td>'
+        '<td><b>Key Age</b></td>'
+        '<td><b>Key Status</b></td>'
+        '<td><b>Last Used</b></td></tr>'
+        .format(os.environ['ACCOUNT_NUMBER'], os.environ['ACCOUNT_NAME'],
+                os.environ['KEY_AGE_WARNING'], os.environ['KEY_AGE_INACTIVE'],
+                os.environ['KEY_AGE_DELETE'], os.environ['EXEMPT_GROUP'])
+    )
+
     htmlFooter = '</table></html>'
     html = htmlHeader + htmlBody + htmlFooter
     log.info('%s', html)
