@@ -1,27 +1,53 @@
 ###############################################################################
+# Name:
+#       Audit Access Key Age
 # Purpose:
-#
+#       Reads the credential report
+#       Determines the age of each access key
+#       Builds a report of all keys older than KEY_AGE_WARNING
+#       Takes action (inactive/delete) on non-compliant Access Keys
 # Permissions:
-#       config:GetComplianceDetailsByResource
-#       ec2:DescribeNetworkInterfaces
-#       ec2:DescribeSecurityGroups
+#       iam:GetCredentialReport
+#       iam:GetAccessKeyLastUsed
+#       iam:ListAccessKeys
+#       iam:ListGroupsForUser
 #       ses:SendEmail
 #       ses:SendRawEmail
 # Environment Variables:
+#       ACCOUNT_NAME: AWS Account (friendly) Name
+#       ACCOUNT_NUMBER: AWS Account Number
+#       ARMED: Set to "true" to take action on keys;
+#               "false" limits to reporting
 #       LOG_LEVEL: (optional): sets the level for function logging
 #                  valid input: critical, error, warning, info (default), debug
+#       EMAIL_ENABLED: used to enable or disable the SES emailed report
 #       EMAIL_SOURCE: send from address for the email, authorized in SES
 #       EMAIL_SUBJECT: subject line for the email
 #       EMAIL_TARGET: default email address if event fails to pass a valid one
-# To-do:
-#
+#       EXEMPT_GROUP: IAM Group that is exempt from actions on access keys
+#       KEY_AGE_DELETE: age at which a key should be deleted (e.g. 120)
+#       KEY_AGE_INACTIVE: age at which a key should be inactive (e.g. 90)
+#       KEY_AGE_WARNING: age at which to warn (e.g. 75)
+#       KEY_USE_THRESHOLD: age at which unused keys should be deleted (e.g.30)
+#       S3_ENABLED: set to "true" and provide S3_BUCKET if the audit report
+#                   should be written to S3
+#       S3_BUCKET: bucket name to write the audit report to if S3_ENABLED is
+#                   set to "true"
 ###############################################################################
 
 from botocore.exceptions import ClientError
+from time import sleep
 import boto3
 import collections
+import csv
+import datetime
+import dateutil
+import io
+import json
 import logging
 import os
+import re
+
 
 ###############################################################################
 # Standard logging config
@@ -54,117 +80,281 @@ log = logging.getLogger(__name__)
 
 
 ###############################################################################
-# Handler
+# HANDLER
 ###############################################################################
 def lambda_handler(event, context):
-    client_config = boto3.client('config')
+    client_iam = boto3.client('iam')
 
-    response = client_config.describe_compliance_by_resource(
-        ResourceType='AWS::EC2::SecurityGroup',
-        ComplianceTypes=[
-            'NON_COMPLIANT',
-        ],
+    # Generate Credential Report
+    report_counter = 0
+    generate_credential_report(client_iam, report_counter)
+
+    # Get Credential Report
+    report = get_credential_report(client_iam)
+
+    # Process Users in Credential Report
+    body = process_users(client_iam, report)
+
+    # Process message for SES
+    process_message(body)
+
+
+###############################################################################
+# Generate IAM Credential Report
+###############################################################################
+def generate_credential_report(client_iam, report_counter):
+
+    generate_report = client_iam.generate_credential_report()
+    sleep(10)
+
+    if generate_report['State'] == 'COMPLETE':
+        # Report is generated, proceed in Handler
+        return None
+    else:
+        # Report is note ready, try again
+        report_counter += 1
+        if report_counter < 5:
+            log.info('Still waiting on report generation')
+            return generate_credential_report(client_iam, report_counter)
+        else:
+            log.info('Credential report generation throttled - exit', exc_info=1)
+            return exit
+
+
+###############################################################################
+# Process IAM Credential Report
+###############################################################################
+def get_credential_report(client_iam):
+
+    credential_report = client_iam.get_credential_report()
+    credential_report_csv = io.StringIO(credential_report['Content'].decode('utf-8'))
+    reader = csv.DictReader(credential_report_csv)
+    return list(reader)
+
+
+###############################################################################
+# Process each user and key in the Credential Report
+###############################################################################
+def process_users(client_iam, report):
+    # Initialize message content
+    htmlBody = ''
+    line = ''
+
+    # Access the credential report and process it
+    for row in report:
+        # A row is a unique IAM user
+        UserName = row['user']
+        log.debug("Processing user: %s", UserName)
+        exemption = False
+        if UserName != '<root_account>':
+
+            # Test group exemption
+            groups = client_iam.list_groups_for_user(UserName=UserName)
+            for g in groups['Groups']:
+                if g['GroupName'] == os.environ['EXEMPT_GROUP']:
+                    exemption = True
+                    log.info('User is exempt via group membership in: %s', g['GroupName'])
+
+            # Process Access Keys for user
+            access_keys = client_iam.list_access_keys(UserName=UserName)
+            for key in access_keys['AccessKeyMetadata']:
+                key_age = object_age(key['CreateDate'])
+                AccessKeyId = key['AccessKeyId']
+
+                # get time of last key use
+                GetKey = client_iam.get_access_key_last_used(
+                    AccessKeyId=AccessKeyId
+                )
+
+                # LastUsedDate value will not exist if key not used
+                LastUsedDate = GetKey['AccessKeyLastUsed'].get('LastUsedDate')
+                if (
+                    not LastUsedDate and
+                    key_age >= int(os.environ['KEY_USE_THRESHOLD']) and
+                    not exemption
+                ):
+                    # Key has not been used and has exceeded age threshold
+                    # NOT EXEMPT: Delete unused
+                    delete_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#E6B0AA">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>DELETED</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), str(LastUsedDate))
+                    )
+                    htmlBody = htmlBody + line
+
+                # Process keys older than warning threshold
+                if key_age < int(os.environ['KEY_AGE_WARNING']):
+                    continue
+
+                if (
+                    key_age >= int(os.environ['KEY_AGE_DELETE']) and
+                    not exemption
+                ):
+                    # NOT EXEMPT: Delete
+                    delete_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#E6B0AA">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>DELETED</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), str(LastUsedDate))
+                    )
+                elif (
+                    key_age >= int(os.environ['KEY_AGE_INACTIVE']) and
+                    not exemption
+                ):
+                    # NOT EXEMPT: Disable
+                    disable_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#F4D03F">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), key['Status'], str(LastUsedDate))
+                    )
+                elif not exemption:
+                    # NOT EXEMPT: Report
+                    line = (
+                        '<tr bgcolor= "#FFFFFF">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), key['Status'], str(LastUsedDate))
+                    )
+                elif (
+                    key_age >= int(os.environ['KEY_AGE_DELETE']) and
+                    exemption and
+                    key['Status'] == 'Inactive'
+                ):
+                    # EXEMPT: Delete if Inactive
+                    delete_access_key(AccessKeyId, UserName, client_iam)
+                    line = (
+                        '<tr bgcolor= "#E6B0AA">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>DELETED</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), str(LastUsedDate))
+                    )
+                elif exemption:
+                    # EXEMPT: Report
+                    line = (
+                        '<tr bgcolor= "#D7DBDD">'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '<td>{}</td>'
+                        '</tr>'
+                        .format(UserName, key['AccessKeyId'],
+                                str(key_age), key['Status'], str(LastUsedDate))
+                    )
+                else:
+                    raise Exception('Unhandled case for Access Key %s', key['AccessKeyId'])
+                htmlBody = htmlBody + line
+
+                # Log it
+                log.info('%s \t %s \t %s \t %s', UserName, key['AccessKeyId'], str(key_age), key['Status'])
+    if str(htmlBody) == "":
+        htmlBody = 'All Access Keys for this account are compliant.'
+    return(htmlBody)
+
+
+###############################################################################
+# Take action on Access Keys
+###############################################################################
+
+# Delete Access Key
+def delete_access_key(AccessKeyId, UserName, client):
+    log.info("Deleting AccessKeyId %s for user %s", AccessKeyId, UserName)
+
+    if os.environ['ARMED'] == 'true':
+        response = client.delete_access_key(
+            UserName=UserName,
+            AccessKeyId=AccessKeyId
+        )
+    else:
+        log.info("Not armed, no action taken")
+
+
+# Disable Access Key
+def disable_access_key(AccessKeyId, UserName, client):
+    log.info("Disabling AccessKeyId %s for user %s", AccessKeyId, UserName)
+
+    if os.environ['ARMED'] == 'true':
+        response = client.update_access_key(
+            UserName=UserName,
+            AccessKeyId=AccessKeyId,
+            Status='Inactive'
+        )
+    else:
+        log.info("Not armed, no action taken")
+
+
+###############################################################################
+# Generate HTML and send to SES
+###############################################################################
+def process_message(htmlBody):
+    htmlHeader = (
+        '<html><h1>Expiring Access Key Report for {} - {} </h1>'
+        '<p>The following access keys are over {} days old '
+        'and will soon be marked inactive ({} days) and deleted ({} days).</p>'
+        '<p>Grayed out rows are exempt via membership in IAM Group: {}</p>'
+        '<table>'
+        '<tr><td><b>IAM User Name</b></td>'
+        '<td><b>Access Key ID</b></td>'
+        '<td><b>Key Age</b></td>'
+        '<td><b>Key Status</b></td>'
+        '<td><b>Last Used</b></td></tr>'
+        .format(os.environ['ACCOUNT_NUMBER'], os.environ['ACCOUNT_NAME'],
+                os.environ['KEY_AGE_WARNING'], os.environ['KEY_AGE_INACTIVE'],
+                os.environ['KEY_AGE_DELETE'], os.environ['EXEMPT_GROUP'])
     )
 
-    # Process each non-compliant Security Group
-    html = '<html><h1>Non-Compliant Security Groups</h1>'
-    for resource in response['ComplianceByResources']:
+    htmlFooter = '</table></html>'
+    html = htmlHeader + htmlBody + htmlFooter
+    log.info('%s', html)
 
-        client_ec2 = boto3.client('ec2')
+    # Optionally write the report to S3
+    if os.environ['S3_ENABLED'] == 'true':
+        client_s3 = boto3.client('s3')
+        s3_key = 'access_key_audit_report_' + str(datetime.date.today()) + '.html'
+        response = client_s3.put_object(
+            Bucket=os.environ['S3_BUCKET'],
+            Key=s3_key,
+            Body=html
+        )
+    else:
+        log.info("S3 report not enabled per environment variable setting")
 
-        # Try/Catch gracefully handles non-Compliant security groups that no longer exist
-        try:
-            security_groups_response = client_ec2.describe_security_groups(
-                GroupIds=[resource['ResourceId']]
-            )
+    # Optionally send report via SES Email
+    if os.environ['EMAIL_ENABLED'] == 'true':
+        # Establish SES Client
+        client_ses = boto3.client('ses')
 
-            security_group = security_groups_response['SecurityGroups'][0]
-            group_name = security_group['GroupName']
-            group_id = security_group['GroupId']
-            group_description = security_group['Description']
-            log.info('Group ID: %s', group_id)
-            log.debug('Group Name: %s', group_name)
-            log.debug('Description: %s', group_description)
-            html_sg = '<h2>'+group_id+': '+group_name+'</h2><p>Description: '+group_description + \
-                '</p><table><tr style="font-weight:bold" bgcolor="#D5DBDB"><td>Protocol</td><td>Port Range</td><td>Source</td></tr>'
-
-            # Process each rule for the Security Group
-            for perm in security_group['IpPermissions']:
-                # Process protocol
-                if str(perm['IpProtocol']) == '-1':
-                    Protocol = 'All'
-                else:
-                    Protocol = str(perm['IpProtocol'])
-
-                # Process PortRange
-                if 'FromPort' not in perm:
-                    PortRange = 'All'
-                elif perm['FromPort'] == -1:
-                    PortRange = 'All'
-                elif perm['FromPort'] != perm['ToPort']:
-                    PortRange = str(perm['FromPort'])+'-'+str(perm['ToPort'])
-                else:
-                    PortRange = str(perm['FromPort'])
-
-                # Process Source
-                try:
-                    Source = str(perm['IpRanges'][0]['CidrIp'])
-                except:
-                    Source = str(perm['UserIdGroupPairs'][0]['GroupId'])
-                else:
-                    Source = 'All'
-
-                log.debug(Protocol + '\t' + PortRange + '\t' + Source + '\t')
-                # Append row to html body table
-                html_sg = html_sg + '<tr><td>' + Protocol + '</td><td>' + \
-                    PortRange + '</td><td>' + Source + '</td></tr>'
-
-            # Close the table for the security group
-            html_sg = html_sg + '</table>'
-            log.debug(html_sg)
-            # Append
-            html = html + html_sg
-            log.debug(html)
-
-            interfaces = client_ec2.describe_network_interfaces(
-                Filters=[
-                    {
-                        'Name': 'group-id',
-                        'Values': [
-                            str(resource['ResourceId'])
-                        ]
-                    }
-                ]
-            )
-            try:
-                html = html + '<p>Attached network interfaces</p><table><tr style="font-weight:bold" bgcolor="#D5DBDB"><td>NetworkInterfaceId</td><td>PrivateIpAddress</td><td>Description</td></tr>'
-                for interface in interfaces['NetworkInterfaces']:
-                    log.debug(interface['NetworkInterfaceId'] + '\t' +
-                              interface['PrivateIpAddress'] + '\t' + interface['Description'])
-                    html = html + '<tr><td>' + interface['NetworkInterfaceId'] + '</td><td>' + \
-                        interface['PrivateIpAddress'] + '</td><td>' + \
-                        interface['Description'] + '</td></tr>'
-                html = html + '</table>'
-            except:
-                log.info('No attached resources')
-        except:
-            log.debug(resource['ResourceId'] + ' \t' + 'does not exist')
-
-        # close the message body
-        html = html + '</html>'
-        log.debug(html)
-    send_message(html)
-
-
-###############################################################################
-# SES Send Email
-###############################################################################
-def send_message(html):
-    # Establish SES Client
-    client_ses = boto3.client('ses')
-
-    # Construct and Send Email
-    try:
+        # Construct and Send Email
         response = client_ses.send_email(
             Destination={
                 'ToAddresses': [os.environ['EMAIL_TARGET']]
@@ -183,7 +373,22 @@ def send_message(html):
             },
             Source=os.environ['EMAIL_SOURCE']
         )
-    except ClientError as e:
-        log.info('Error: %s', e.response['Error']['Message'])
-    else:
         log.info('Success. Message ID: %s', response['MessageId'])
+    else:
+        log.info("Email not enabled per environment variable setting")
+
+
+###############################################################################
+# Determine days since last change
+###############################################################################
+def object_age(last_changed):
+    # Handle as string
+    if type(last_changed) is str:
+        last_changed_date = dateutil.parser.parse(last_changed).date()
+    # Handle as native datetime
+    elif type(last_changed) is datetime.datetime:
+        last_changed_date = last_changed.date()
+    else:
+        return 0
+    age = datetime.date.today() - last_changed_date
+    return age.days
