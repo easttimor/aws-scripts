@@ -15,11 +15,27 @@
 #       s3:PutObject
 #       ses:SendEmail
 # Environment Variables:
+#       ACCOUNT_NAME: AWS Account (friendly) Name
+#       ACCOUNT_NUMBER: AWS Account Number
+#       ARMED: Set to "true" to take action on keys;
+#               "false" limits to reporting
+#       EMAIL_ENABLED: used to enable or disable the SES emailed report
+#       EMAIL_SOURCE: send from address for the email, authorized in SES
+#       EMAIL_SUBJECT: subject line for the email
+#       EMAIL_TARGET: default email address if event fails to pass a valid one
+#       EXEMPT_GROUP: IAM Group that is exempt from actions on access keys
 #       LOG_LEVEL: (optional): sets the level for function logging
 #                  valid input: critical, error, warning, info (default), debug
+#       S3_ENABLED: set to "true" and provide S3_BUCKET if the audit report
+#                   should be written to S3
+#       S3_BUCKET: bucket name to write the audit report to if S3_ENABLED is
+#                   set to "true"
+#       TAG_EXEMPTION_KEY: tag Key to ignore the security group
+#       TAG_EXEMPTION_VALUE: tag Value to ignore the security group
 # To Do:
 #       paginate describe_security_groups
 #       paginate describe_network_interfaces
+#       better handling of groups with dependencies
 ###############################################################################
 
 from botocore.exceptions import ClientError
@@ -116,19 +132,21 @@ def process_security_groups(ec2_client):
                 ]
             )
 
-            # Evaluate tags
+            # Evaluate tags to determine exemption
             for item in response['Tags']:
-                if 'Key' in item:
-                    if item['Key'] == 'Exempt':
-                        exempt = True
-                        log.info('Exempt %s', sg['GroupId'])
+                if (
+                    'Key' in item and
+                    str(item['Key']).lower() == str(os.environ['TAG_EXEMPTION_KEY']).lower() and
+                    str(item['Value']).lower() == str(os.environ['TAG_EXEMPTION_VALUE']).lower()
+                ):
+                    exempt = True
+                    log.info('Exempt %s', sg['GroupId'])
 
             # Evaluate for deletion
             if (
                 sg['GroupName'] != 'default' and
                 not exempt
             ):
-
                 # Delete ingress rules to remove dependencies
                 for rule in sg['IpPermissions']:
                     response = ec2_client.revoke_security_group_ingress(
@@ -186,8 +204,8 @@ def process_security_groups(ec2_client):
         # Update report to notify of deletion issues
         line = (
             '</table>'
-            '<p>The following security groups could not be deleted'
-            'due to dependency issues. Please manually resolve: {}</p>'
+            '<p>The following security groups could not be deleted '
+            'due to dependency issues.<br>Please manually resolve: {}</p>'
             '</html>'
             .format(results)
         )
@@ -225,7 +243,7 @@ def delete_security_groups(ec2_client, deletion_list):
 def process_report(htmlBody):
     htmlHeader = (
         '<html><h1>Security Group Report for {} - {} </h1>'
-        '<p>The following security groups have no attached network interfaces</p>'
+        '<p>The following security groups have no attached network interfaces.</p>'
         '<p>Grayed out rows are exempt via tag: </p>'
         '<table>'
         '<tr><td><b>Security Group ID</b></td>'
