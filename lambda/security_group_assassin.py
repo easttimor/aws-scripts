@@ -4,8 +4,8 @@
 # Purpose:
 #       Gets a list of all security groups
 #       Looks for security groups with no attached ENIs
-#       Outputs those security groups
-#           with the assumption that they can be deleted
+#       Outputs those security groups to choice of log, SES, S3
+#       Optionally attempts to delete non-compliant security groups
 # Permissions:
 #       in addition to default CloudWatch Logs
 #       ec2:DeleteSecurityGroup
@@ -82,17 +82,21 @@ def lambda_handler(event, context):
 
     # Establish client, get list of security groups
     ec2_client = boto3.client('ec2')
-    body = process_security_groups(ec2_client)
+    report_body = process_security_groups(ec2_client)
 
     # Process the report via SES and/or S3
-    process_report(body)
+    process_report(report_body)
 
 
 ###############################################################################
 # Process Security Groups
 ###############################################################################
 def process_security_groups(ec2_client):
+
+    # Get list of Security Groups
     response = ec2_client.describe_security_groups()
+
+    #initialize
     htmlBody = ''
     deletion_list = []
 
@@ -100,9 +104,10 @@ def process_security_groups(ec2_client):
     for sg in response['SecurityGroups']:
         log.debug('%s,%s,%s', sg['GroupId'], sg['VpcId'], sg['GroupName'])
 
-        # reinitialize
+        # reinitialize for each security group
         exempt = False
 
+        # get list of attached ENI for specific security group
         interfaces = ec2_client.describe_network_interfaces(
             Filters=[
                 {
@@ -115,10 +120,10 @@ def process_security_groups(ec2_client):
         )
 
         if not interfaces['NetworkInterfaces']:
-            # Security Group has no attached ENI(s)
+            # Security group has no attached ENI(s)
             log.info('Found %s,%s,%s', sg['GroupId'], sg['VpcId'], sg['GroupName'])
 
-            # Get tags
+            # Get tags for the security group
             response = ec2_client.describe_tags(
                 Filters=[
                     {
@@ -187,7 +192,7 @@ def process_security_groups(ec2_client):
                 )
 
             # Add entry in report
-            htmlBody = htmlBody + line
+            htmlBody += line
 
     # Send list of security groups for deletion
     results = delete_security_groups(ec2_client, deletion_list)
@@ -209,7 +214,7 @@ def process_security_groups(ec2_client):
             '</html>'
             .format(results)
         )
-        htmlBody = htmlBody + line
+        htmlBody += line
     else:
         line = (
             '</table></html>'

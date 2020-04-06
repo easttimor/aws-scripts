@@ -5,6 +5,7 @@
 #       config:GetComplianceDetailsByResource
 #       ec2:DescribeNetworkInterfaces
 #       ec2:DescribeSecurityGroups
+#       s3:PutObject
 #       ses:SendEmail
 #       ses:SendRawEmail
 # Environment Variables:
