@@ -98,6 +98,7 @@ def process_security_groups(ec2_client):
 
     #initialize
     htmlBody = ''
+    results = ''
     deletion_list = []
 
     # Evaluate each security group
@@ -152,22 +153,26 @@ def process_security_groups(ec2_client):
                 sg['GroupName'] != 'default' and
                 not exempt
             ):
-                # Delete ingress rules to remove dependencies
-                for rule in sg['IpPermissions']:
-                    response = ec2_client.revoke_security_group_ingress(
-                        GroupId=sg['GroupId'],
-                        IpPermissions=[rule]
-                    )
 
-                # Delete egress rules to remove dependencies
-                for rule in sg['IpPermissionsEgress']:
-                    response = ec2_client.revoke_security_group_egress(
-                        GroupId=sg['GroupId'],
-                        IpPermissions=[rule]
-                    )
+                # Process only if function is armed
+                if str(os.environ['ARMED']).lower() == 'true':
 
-                # Add security group to list for deletion
-                deletion_list.append(sg['GroupId'])
+                    # Delete ingress rules to remove dependencies
+                    for rule in sg['IpPermissions']:
+                        response = ec2_client.revoke_security_group_ingress(
+                            GroupId=sg['GroupId'],
+                            IpPermissions=[rule]
+                        )
+
+                    # Delete egress rules to remove dependencies
+                    for rule in sg['IpPermissionsEgress']:
+                        response = ec2_client.revoke_security_group_egress(
+                            GroupId=sg['GroupId'],
+                            IpPermissions=[rule]
+                        )
+
+                    # Add security group to list for deletion
+                    deletion_list.append(sg['GroupId'])
 
                 # Report entry
                 line = (
@@ -194,8 +199,9 @@ def process_security_groups(ec2_client):
             # Add entry in report
             htmlBody += line
 
-    # Send list of security groups for deletion
-    results = delete_security_groups(ec2_client, deletion_list)
+    # If ARMED, send list of security groups for deletion
+    if str(os.environ['ARMED']).lower() == 'true':
+        results = delete_security_groups(ec2_client, deletion_list)
 
     # close and return htmlBody to report
     if str(htmlBody) == "":
@@ -261,7 +267,7 @@ def process_report(htmlBody):
     log.debug('%s', html)
 
     # Optionally write the report to S3
-    if os.environ['S3_ENABLED'] == 'true':
+    if str(os.environ['S3_ENABLED']).lower() == 'true':
         client_s3 = boto3.client('s3')
         s3_key = 'security_group_audit_report_' + str(datetime.date.today()) + '.html'
         response = client_s3.put_object(
@@ -273,7 +279,7 @@ def process_report(htmlBody):
         log.info("S3 report not enabled per environment variable setting")
 
     # Optionally send report via SES Email
-    if os.environ['EMAIL_ENABLED'] == 'true':
+    if str(os.environ['EMAIL_ENABLED']).lower() == 'true':
         # Establish SES Client
         client_ses = boto3.client('ses')
 
