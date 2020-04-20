@@ -8,8 +8,8 @@
 # Trigger:
 #       CloudWatch Events scheduler
 # Recommended Function Settings (varies by environment):
-#       192 MB Memory
-#       10 min Timeout
+#       128 MB Memory
+#       15 min Timeout
 # Environment Variables:
 #       LOG_LEVEL: (optional): sets the level for function logging
 #                  valid input: critical, error, warning, info (default), debug
@@ -19,7 +19,6 @@
 #       S3_BUCKET_OUTPUT: Bucket for Athena query results
 #       DATABASE: Athena database name (e.g. default)
 #       TABLE_PREFIX: Athena table prefix (e.g. cloudtrail)
-#       SQS_URL: URL of the SQS Queue to receive messages for processing
 # Credit:
 #       This code orginated with duo-labs cloudtrail-partitioner
 #       https://github.com/duo-labs/cloudtrail-partitioner
