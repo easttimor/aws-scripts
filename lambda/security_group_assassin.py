@@ -39,6 +39,7 @@
 ###############################################################################
 
 from botocore.exceptions import ClientError
+from distutils.util import strtobool
 import boto3
 import collections
 import datetime
@@ -80,24 +81,38 @@ log = logging.getLogger(__name__)
 ###############################################################################
 def lambda_handler(event, context):
 
+    # Load configuration values
+    config = {}
+    config['tag_exemption_key'] = os.environ['TAG_EXEMPTION_KEY'].lower()
+    config['tag_exemption_value'] = os.environ['TAG_EXEMPTION_VALUE'].lower()
+    config['armed'] = strtobool(os.environ['ARMED'])
+    config['account_number'] = os.environ['ACCOUNT_NUMBER']
+    config['account_name'] = os.environ['ACCOUNT_NAME']
+    config['s3_enabled'] = strtobool(os.environ['S3_ENABLED'])
+    config['s3_bucket'] = os.environ['S3_BUCKET']
+    config['email_enabled'] = strtobool(os.environ['EMAIL_ENABLED'])
+    config['email_target'] = os.environ['EMAIL_TARGET']
+    config['email_subject'] = os.environ['EMAIL_SUBJECT']
+    config['email_source'] = os.environ['EMAIL_SOURCE']
+
     # Establish client, get list of security groups
     ec2_client = boto3.client('ec2')
-    report_body = process_security_groups(ec2_client)
+    report_body = process_security_groups(ec2_client, config)
 
     # Process the report via SES and/or S3
-    process_report(report_body)
+    process_report(report_body, config)
 
 
 ###############################################################################
 # Process Security Groups
 ###############################################################################
-def process_security_groups(ec2_client):
+def process_security_groups(ec2_client, config):
 
     # Get list of Security Groups
     response = ec2_client.describe_security_groups()
 
-    #initialize
-    htmlBody = ''
+    # initialize
+    html_body = ''
     results = ''
     deletion_list = []
 
@@ -142,11 +157,11 @@ def process_security_groups(ec2_client):
             for item in response['Tags']:
                 if (
                     'Key' in item and
-                    str(item['Key']).lower() == str(os.environ['TAG_EXEMPTION_KEY']).lower() and
-                    str(item['Value']).lower() == str(os.environ['TAG_EXEMPTION_VALUE']).lower()
+                    str(item['Key']).lower() == config['tag_exemption_key'] and
+                    str(item['Value']).lower() == config['tag_exemption_value']
                 ):
                     exempt = True
-                    log.info('Exempt %s', sg['GroupId'])
+                    log.info('Tag Exempt %s', sg['GroupId'])
 
             # Evaluate for deletion
             if (
@@ -155,7 +170,7 @@ def process_security_groups(ec2_client):
             ):
 
                 # Process only if function is armed
-                if str(os.environ['ARMED']).lower() == 'true':
+                if config['armed']:
 
                     # Delete ingress rules to remove dependencies
                     for rule in sg['IpPermissions']:
@@ -197,16 +212,16 @@ def process_security_groups(ec2_client):
                 )
 
             # Add entry in report
-            htmlBody += line
+            html_body += line
 
     # If ARMED, send list of security groups for deletion
-    if str(os.environ['ARMED']).lower() == 'true':
+    if config['armed']:
         results = delete_security_groups(ec2_client, deletion_list)
 
-    # close and return htmlBody to report
-    if str(htmlBody) == "":
+    # close and return html_body to report
+    if not html_body:
         # Address the case of total compliance
-        htmlBody = (
+        html_body = (
             '</table>'
             '<p>All Security Groups for this account are compliant.</p>'
             '</html>'
@@ -220,14 +235,14 @@ def process_security_groups(ec2_client):
             '</html>'
             .format(results)
         )
-        htmlBody += line
+        html_body += line
     else:
         line = (
             '</table></html>'
         )
-        htmlBody = htmlBody + line
+        html_body = html_body + line
 
-    return(htmlBody)
+    return(html_body)
 
 
 ###############################################################################
@@ -237,22 +252,25 @@ def delete_security_groups(ec2_client, deletion_list):
 
     dependency_list = []
     for sg in deletion_list:
-        log.info('Delete %s', sg)
         try:
+            log.info('Delete %s', sg)
             response = ec2_client.delete_security_group(
                 GroupId=sg
             )
-        except:
-            log.info('Dependency issue with %s', sg)
-            dependency_list.append(sg)
+        except ClientError as error:
+            if error.response['Error']['Code'] == 'DependencyViolation':
+                log.info('Dependency issue with %s', sg)
+                dependency_list.append(sg)
+            else:
+                raise error
     return dependency_list
 
 
 ###############################################################################
 # Generate HTML and send to SES
 ###############################################################################
-def process_report(htmlBody):
-    htmlHeader = (
+def process_report(html_body, config):
+    html_header = (
         '<html><h1>Security Group Report for {} - {} </h1>'
         '<p>The following security groups have no attached network interfaces.</p>'
         '<p>Grayed out rows are exempt via tag: </p>'
@@ -260,18 +278,18 @@ def process_report(htmlBody):
         '<tr><td><b>Security Group ID</b></td>'
         '<td><b>VPC ID</b></td>'
         '<td><b>Security Group Name</b></td></tr>'
-        .format(os.environ['ACCOUNT_NUMBER'], os.environ['ACCOUNT_NAME'])
+        .format(config['account_number'], config['account_name'])
     )
 
-    html = htmlHeader + htmlBody
+    html = html_header + html_body
     log.debug('%s', html)
 
     # Optionally write the report to S3
-    if str(os.environ['S3_ENABLED']).lower() == 'true':
+    if config['s3_enabled']:
         client_s3 = boto3.client('s3')
-        s3_key = 'security_group_audit_report_' + str(datetime.date.today()) + '.html'
+        s3_key = 'security_group_audit_report_{}.html'.format(datetime.date.today())
         response = client_s3.put_object(
-            Bucket=os.environ['S3_BUCKET'],
+            Bucket=config['s3_bucket'],
             Key=s3_key,
             Body=html
         )
@@ -279,14 +297,14 @@ def process_report(htmlBody):
         log.info("S3 report not enabled per environment variable setting")
 
     # Optionally send report via SES Email
-    if str(os.environ['EMAIL_ENABLED']).lower() == 'true':
+    if config['email_enabled']:
         # Establish SES Client
         client_ses = boto3.client('ses')
 
         # Construct and Send Email
         response = client_ses.send_email(
             Destination={
-                'ToAddresses': [os.environ['EMAIL_TARGET']]
+                'ToAddresses': [config['email_target']]
             },
             Message={
                 'Body': {
@@ -297,10 +315,10 @@ def process_report(htmlBody):
                 },
                 'Subject': {
                     'Charset': "UTF-8",
-                    'Data': os.environ['EMAIL_SUBJECT'],
+                    'Data': config['email_subject'],
                 },
             },
-            Source=os.environ['EMAIL_SOURCE']
+            Source=config['email_source']
         )
         log.info('Success. Message ID: %s', response['MessageId'])
     else:
