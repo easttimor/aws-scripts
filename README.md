@@ -31,7 +31,7 @@ For a specific profiles
 For all profiles
 ./aws_rotate_access_key.sh -a
 
-## Acess Key Audit (Lambda/Python)
+### Acess Key Audit (Lambda/Python)
 Scans all Access Keys in an AWS account. Sets keys to Inactive or Delete based on configurable age values. Deletes unused keys based on configurable age values. Optionally sends an HTML formatted report via SES or writes it to S3. Optionally works in report-only mode with no actions taken. Best to begin in report-only mode until you get comfortable.
 
 1. Reads the credential report
