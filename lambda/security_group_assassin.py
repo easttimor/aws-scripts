@@ -23,15 +23,14 @@
 #       EMAIL_SOURCE: send from address for the email, authorized in SES
 #       EMAIL_SUBJECT: subject line for the email
 #       EMAIL_TARGET: default email address if event fails to pass a valid one
-#       EXEMPT_GROUP: IAM Group that is exempt from actions on access keys
 #       LOG_LEVEL: (optional): sets the level for function logging
 #                  valid input: critical, error, warning, info (default), debug
 #       S3_ENABLED: set to "true" and provide S3_BUCKET if the audit report
 #                   should be written to S3
 #       S3_BUCKET: bucket name to write the audit report to if S3_ENABLED is
 #                   set to "true"
-#       TAG_EXEMPTION_KEY: tag Key to ignore the security group
-#       TAG_EXEMPTION_VALUE: tag Value to ignore the security group
+#       TAG_EXEMPTION_KEY: comma delimited tag Key to ignore the security group
+#       TAG_EXEMPTION_VALUE: comma delimited tag Value to ignore the security group
 # To Do:
 #       paginate describe_security_groups
 #       paginate describe_network_interfaces
@@ -83,8 +82,8 @@ def lambda_handler(event, context):
 
     # Load configuration values
     config = {}
-    config['tag_exemption_key'] = os.environ['TAG_EXEMPTION_KEY'].lower()
-    config['tag_exemption_value'] = os.environ['TAG_EXEMPTION_VALUE'].lower()
+    config['tag_exemption_key'] = os.environ['TAG_EXEMPTION_KEY'].lower().split(',')
+    config['tag_exemption_value'] = os.environ['TAG_EXEMPTION_VALUE'].lower().split(',')
     config['armed'] = strtobool(os.environ['ARMED'])
     config['account_number'] = os.environ['ACCOUNT_NUMBER']
     config['account_name'] = os.environ['ACCOUNT_NAME']
@@ -155,13 +154,19 @@ def process_security_groups(ec2_client, config):
 
             # Evaluate tags to determine exemption
             for item in response['Tags']:
-                if (
-                    'Key' in item and
-                    str(item['Key']).lower() == config['tag_exemption_key'] and
-                    str(item['Value']).lower() == config['tag_exemption_value']
-                ):
-                    exempt = True
-                    log.info('Tag Exempt %s', sg['GroupId'])
+                for index, key in enumerate(config['tag_exemption_key']):
+                    try:
+                        if (
+                            'Key' in item and
+                            str(item['Key']).lower() == key and
+                            str(item['Value']).lower() == config['tag_exemption_value'][index]
+                        ):
+                            exempt = True
+                            log.info('Tag Exempt %s', sg['GroupId'])
+                            break
+                    except IndexError as error:
+                        log.info('Error: %s', error)
+                        log.info('Error: Must have equal number of entries for TAG_EXEMPTION_KEY as TAG_EXEMPTION_VALUE')
 
             # Evaluate for deletion
             if (
